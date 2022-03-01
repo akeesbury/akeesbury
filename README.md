@@ -1,4 +1,4 @@
-- 👋 Hi, I’m @akeesbury.
+- 👋 Hi, I’m @akeesbury, Business Analyst, B2B.
 - 👀 I’m interested in SP3 (B2B) data + all relevant analysis.
 - 🌱 I’m currently learning everything, I'm brand new, as of 2/28/2022.
 - 💞️ I’m looking to collaborate on B2B reporting + data initiatives and easing the SP3 data workload from the analytics team.
