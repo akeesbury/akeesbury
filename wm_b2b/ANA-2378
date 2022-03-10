@@ -1,0 +1,99 @@
+-- the idea here is to break up the different breakouts needed for ANA-2378 and piece together in a final select --
+-- https://weedmaps.atlassian.net/browse/ANA-2378 --
+-- variables requested: https://docs.google.com/spreadsheets/d/1dL8cNqDzhTNHo12WXKbhyEMP9jnlo0g_VtEqMY5WKsc/edit#gid=0 -- 
+
+-- temp to pull the most recent update time from live menu snapshot per wmid/listing--
+drop table if exists temp_latest_snap;
+create table temp_latest_snap as(
+    select lms.wmid, lms.listing_id, LOWER(lms.listing_type) as list_type, max(lms.inserted_at) as last_update
+    from report.sp3_live_menu_snapshot lms
+    group by 1,2,3
+);
+-- temp to attribute active live menu refreshes to listings/wmid --
+drop table if exists temp_3_refreshes;
+create table temp_3_refreshes AS (
+         SELECT dd.calendar_date
+              , lms.wmid
+              ,  lms.listing_id
+              , lms.listing_type
+         , count(distinct lms.last_refreshed_at) as refreshes
+         FROM report.dim_date dd
+                  LEFT JOIN report.sp3_live_menu_snapshot lms ON CONVERT_TIMEZONE('America/Los_Angeles', 'UTC', lms.inserted_at)::DATE = dd.calendar_date
+                  INNER JOIN report.sp3_paid_clients pc ON lms.wmid = pc.wmid AND CONVERT_TIMEZONE('America/Los_Angeles', 'UTC', lms.inserted_at)::DATE = pc.calendar_date
+         WHERE dd.calendar_date BETWEEN '2021-09-29' AND CURRENT_DATE
+         GROUP BY 1, 2,3,4
+     );
+-- temp to pull sf data + determine listing type --
+drop table if exists temp_sf;
+create temp table temp_sf as(
+       SELECT DISTINCT COALESCE(pos_systems__c, other_pos_type__c)                                                                                      pos_name
+              , dd.calendar_date
+                     , bcli.wmid__c wmid
+              , bcli.listing_number__c::INT                                                                            listing_id
+                     , bcli.region__c
+                     , bcli.region_name__c
+                     , BCLI.regionstate__c
+              , LOWER(CASE WHEN p.cbd__c = 't' AND p.category2__c = 'Dispensary' THEN 'Store' ELSE p.category2__c END) listing_type
+        FROM report.dim_date dd
+         LEFT JOIN sf.sf_billing_contract_line_item_c bcli ON dd.calendar_date BETWEEN bcli.start_date__c AND COALESCE(bcli.enddate__c, '9999-12-31')
+         LEFT JOIN sf.sf_product2 p ON bcli.product__c = p.id
+         LEFT JOIN sf.sf_account a ON bcli.account__c = a.id
+    WHERE bcli.isdeleted = FALSE
+  AND (p.category2__c IN ('Delivery', 'Dispensary', 'Doctor') OR p.cbd__c = 't' AND p.category2__c = 'Dispensary')
+  AND bcli.start_date__c IS NOT NULL
+  AND bcli.listing_number__c ~ '^[+]?[0-9]*$' -- removes non-numeric and negative numbers
+  AND LEN(bcli.listing_number__c) < 10        -- removes BIGINT numbers
+  AND dd.calendar_date = CURRENT_DATE
+);
+
+-- temp wrangler table to bring together all above attributes --
+drop table if exists temp_wrangler;
+create temp table temp_wrangler as (
+    select distinct coalesce(sf.pos_name, lms.pos_name) as                        pos_name
+                  , sf.listing_id                       as                        sf_listing_id
+ --                 , sf.wmid                             as                        sf_wmid
+ --                 , lms.wmid                            as                        lms_wmid
+ --                 , sf.pos_name                         as                        sf_pos_name
+ --                 , lms.pos_name                        as                        lms_pos_name
+                  , sf.listing_type                     as                        listing_type
+ --                 , lms.listing_type                    as                        lms_listing_type
+ --                 , lms.last_refreshed_at
+ --                 , lms.inserted_at
+                  , sf.region__c
+                  , case when lms.integration_type is not null then 'true' else 'false' end as is_integrated
+                  , CASE WHEN t3.refreshes >= 3 then 'true' else 'false' end is_active
+                  , lms.integration_type
+                  , dl.order_enabled as  orders_enabled
+                  , CASE WHEN dls.integrator_id IS NOT NULL THEN 'true'  ELSE 'false' END as orders_integrated
+                  , COUNT(distinct o.id) as orders_placed
+    FROM report.dim_date dd
+             left join temp_sf sf on dd.calendar_date = sf.calendar_date
+             left join temp_latest_snap tls on sf.wmid = tls.wmid
+             left join temp_3_refreshes t3 on sf.wmid = t3.wmid
+             left join report.sp3_live_menu_snapshot lms on sf.wmid = lms.wmid and lms.inserted_at = tls.last_update
+             LEFT JOIN report.daily_listing_snapshot dls ON lms.wmid = dls.wmid and dls.calendar_date = dd.calendar_date
+             left join report.dim_listings dl on sf.wmid = dl.wmid and dl.active = 'true'
+             LEFT JOIN oos.orders o ON lms.wmid = o.wmid and o.status NOT IN (0, 8, 9, 16, 25, 4, 14, 17)
+    where dd.calendar_date = current_date
+    group by 1, 2, 3, 4, 5, 6, 7, 8, 9
+);
+
+-- sample final select pulling aggregates by pos_name --
+select distinct pos_name
+, count(distinct sf_listing_id) as listings
+, count(distinct case when is_integrated = 'true' then sf_listing_id else null end) as integrated_live_menu
+, count(distinct case when is_active = 'true' then sf_listing_id else null end) as active_live_menu
+, count(distinct case when integration_type = 'menu_api' then sf_listing_id else null end) as menu_api
+, count(distinct case when integration_type = 'crawler' then sf_listing_id else null end) as crawler
+, count(distinct case when integration_type = 'catalog_api' then sf_listing_id else null end) as catalog_api
+, count(distinct case when orders_enabled = 'true' then sf_listing_id else null end) as orders_enabled
+, count(distinct case when orders_integrated = 'true' then sf_listing_id else null end) as orders_integrated
+, count(distinct case when orders_placed >= 1 then sf_listing_id else null end) as active_orders
+from temp_wrangler
+group by 1
+
+
+-- sample select all to check specific pos_name from above --
+select *
+from temp_wrangler
+where pos_name = 'Menu Monster'
